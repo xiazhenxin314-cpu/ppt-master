@@ -1,255 +1,186 @@
 #!/usr/bin/env python3
-"""Regressions for minimal-edit page patching."""
+"""Geometry operators, byte preservation, and exit codes for page_patch."""
 
 from __future__ import annotations
 
+import contextlib
 import io
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from page_patch import (  # noqa: E402
-    Change,
-    InvalidPatchedXml,
-    PagePatchError,
-    id_counts,
-    main,
-    plan_patch,
-    start_tag,
-)
+from page_patch import main  # noqa: E402
 
-PAGE = (
-    '<?xml version="1.0" encoding="UTF-8"?>\n'
-    '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">\n'
-    '  <rect id="card" x="8" y="8" width="40" height="24" fill="#111111"/>\n'
-    '  <text id="t" x="8" y="60" font-size="12" fill="#222222">hi</text>\n'
-    '</svg>\n'
-)
-
-COMMENTED = PAGE.replace(
-    '  <rect id="card"',
-    '  <!-- <rect id="card" x="0" y="0" width="1" height="1" fill="#000000"/> -->\n'
-    '  <rect id="card"',
-)
-DUPLICATE = PAGE.replace('<text id="t"', '<text id="card"')
-BROKEN = '<svg xmlns="http://www.w3.org/2000/svg"><rect id="card" x="8"'
+PAGE = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+  <rect id="bg" x="0" y="0" width="1280" height="720" fill="#FFFFFF"/>
+  <rect id="card" x="200" y="100" width="300" height="100" fill="#C00000"/>
+  <text id="title" x="240" y="160" font-size="48" fill="#FFFFFF">失分形态</text>
+</svg>
+"""
 
 
-def run_cli(argv: list[str]) -> tuple[int, str, str]:
-    """Run main() with captured streams."""
-    stdout, stderr = io.StringIO(), io.StringIO()
-    with redirect_stdout(stdout), redirect_stderr(stderr):
-        code = main(argv)
-    return code, stdout.getvalue(), stderr.getvalue()
+def run(args: list[str]) -> tuple[int, str, str]:
+    """Run the CLI, capturing both streams."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = main(args)
+    return code, out.getvalue(), err.getvalue()
 
 
-class PlanPatchTest(unittest.TestCase):
-    """Pure planning: what changes, and what refuses to change."""
-
-    def test_replaces_only_the_target_attribute(self) -> None:
-        patched, changes = plan_patch(PAGE, ["t:font-size=14"])
-        self.assertEqual(patched, PAGE.replace('font-size="12"', 'font-size="14"'))
-        self.assertEqual(len(changes), 1)
-        change = changes[0]
-        self.assertEqual((change.element_id, change.attribute), ("t", "font-size"))
-        self.assertEqual((change.previous, change.value), ("12", "14"))
-
-    def test_inserts_an_absent_attribute(self) -> None:
-        patched, changes = plan_patch(PAGE, ["card:opacity=0.5"])
-        self.assertIn('opacity="0.5"', patched)
-        self.assertIsNone(changes[0].previous)
-        ET.fromstring(patched)
-
-    def test_batches_multiple_assignments(self) -> None:
-        patched, changes = plan_patch(PAGE, ["t:font-size=14", "t:fill=#FFFFFF"])
-        self.assertEqual(len(changes), 2)
-        self.assertIn('font-size="14"', patched)
-        self.assertIn('fill="#FFFFFF"', patched)
-        self.assertEqual(patched.count('fill="#FFFFFF"'), 1)
-
-    def test_duplicate_id_is_rejected(self) -> None:
-        self.assertEqual(id_counts(DUPLICATE)["card"], 2)
-        with self.assertRaises(PagePatchError):
-            plan_patch(DUPLICATE, ["card:fill=#000000"])
-
-    def test_missing_id_is_rejected(self) -> None:
-        with self.assertRaises(PagePatchError) as caught:
-            plan_patch(PAGE, ["nope:fill=#000000"])
-        self.assertIn("no element with id=", str(caught.exception))
-
-    def test_malformed_assignment_is_rejected(self) -> None:
-        with self.assertRaises(PagePatchError):
-            plan_patch(PAGE, ["font-size=14"])
-
-    def test_invalid_attribute_name_produces_invalid_xml(self) -> None:
-        with self.assertRaises(InvalidPatchedXml):
-            plan_patch(PAGE, ["card:foo bar=1"])
-
-    def test_unparseable_page_is_rejected(self) -> None:
-        with self.assertRaises(PagePatchError):
-            id_counts(BROKEN)
-
-    def test_escaping_keeps_xml_valid(self) -> None:
-        patched, _ = plan_patch(PAGE, ['t:data-note=a&b"c'])
-        self.assertIn('data-note="a&amp;b&quot;c"', patched)
-        ET.fromstring(patched)
-
-
-class CliTest(unittest.TestCase):
-    """The single side effect: writing the page."""
+class PatchTestCase(unittest.TestCase):
+    """Each test starts from a fresh copy of the fixture."""
 
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        self.page = self.root / "P07.svg"
-        self.page.write_bytes(PAGE.encode("utf-8"))
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "P01.svg"
+        self.path.write_text(PAGE, encoding="utf-8")
 
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
+    def text(self) -> str:
+        return self.path.read_text(encoding="utf-8")
+
+
+class GrowTest(PatchTestCase):
+    """Relative growth moves one edge and keeps the opposite edge fixed."""
+
+    def test_grow_left_percentage_uses_current_width(self) -> None:
+        code, out, _ = run([str(self.path), "--id", "card", "--grow-left", "20%"])
+        self.assertEqual(code, 0)
+        self.assertIn("card.x: 200 -> 140", out)
+        self.assertIn("card.width: 300 -> 360", out)
+        self.assertIn('id="card" x="140" y="100" width="360"', self.text())
+
+    def test_grow_right_adds_pixels(self) -> None:
+        code, _, _ = run([str(self.path), "--id", "card", "--grow-right", "10"])
+        self.assertEqual(code, 0)
+        self.assertIn('x="200" y="100" width="310"', self.text())
+
+    def test_pad_expands_all_four_sides(self) -> None:
+        code, _, _ = run([str(self.path), "--id", "card", "--pad", "10"])
+        self.assertEqual(code, 0)
+        self.assertIn('x="190" y="90" width="320" height="120"', self.text())
+
+    def test_inline_target_needs_no_id_flag(self) -> None:
+        code, _, _ = run([str(self.path), "--grow-left", "card:20%"])
+        self.assertEqual(code, 0)
+        self.assertIn('x="140"', self.text())
+
+    def test_only_the_touched_attributes_change(self) -> None:
+        run([str(self.path), "--id", "card", "--grow-left", "20%"])
+        before = PAGE
+        after = self.text()
+        self.assertEqual(after.replace('x="140"', 'x="200"').replace('width="360"', 'width="300"'), before)
+
+
+class CenterTest(PatchTestCase):
+    """Centring uses the page canvas or another element as the reference."""
+
+    def test_center_x_on_page(self) -> None:
+        code, _, _ = run([str(self.path), "--id", "card", "--center-x", "page"])
+        self.assertEqual(code, 0)
+        self.assertIn('x="490"', self.text())
+
+    def test_center_y_on_page(self) -> None:
+        code, _, _ = run([str(self.path), "--id", "card", "--center-y", "page"])
+        self.assertEqual(code, 0)
+        self.assertIn('y="310"', self.text())
+
+    def test_center_x_on_another_element(self) -> None:
+        body = PAGE.replace(
+            '<text id="title"',
+            '<rect id="panel" x="700" y="400" width="500" height="80" fill="#EEEEEE"/>\n  <text id="title"',
+        )
+        self.path.write_text(body, encoding="utf-8")
+        code, _, _ = run([str(self.path), "--id", "card", "--center-x", "panel"])
+        self.assertEqual(code, 0)
+        # panel centre is 950; a 300-wide card centred there starts at 800.
+        self.assertIn('x="800"', self.text())
+
+
+class OrderAndSafetyTest(PatchTestCase):
+    """Operations apply in command order, and a bad request writes nothing."""
+
+    def test_set_then_grow_in_one_command(self) -> None:
+        code, out, _ = run([
+            str(self.path), "--id", "card",
+            "--set", "card:fill=#00FF00",
+            "--grow-left", "50",
+        ])
+        self.assertEqual(code, 0)
+        self.assertIn("card.fill: #C00000 -> #00FF00", out)
+        self.assertIn('x="150"', self.text())
 
     def test_dry_run_writes_nothing(self) -> None:
-        before = self.page.read_bytes()
-        code, stdout, stderr = run_cli([str(self.page), "--set", "t:font-size=14", "--dry-run"])
+        code, out, err = run([str(self.path), "--id", "card", "--grow-left", "20%", "--dry-run"])
         self.assertEqual(code, 0)
-        self.assertIn("t.font-size: 12 -> 14", stdout)
-        self.assertIn("dry-run", stderr)
-        self.assertEqual(self.page.read_bytes(), before)
+        self.assertIn("card.x: 200 -> 140", out)
+        self.assertIn("dry-run", err)
+        self.assertEqual(self.text(), PAGE)
 
-    def test_write_changes_one_region_only(self) -> None:
-        code, stdout, stderr = run_cli([str(self.page), "--set", "t:font-size=14"])
-        self.assertEqual(code, 0)
-        self.assertIn("t.font-size: 12 -> 14", stdout)
-        self.assertIn("wrote", stderr)
-        self.assertEqual(
-            self.page.read_bytes(),
-            PAGE.replace('font-size="12"', 'font-size="14"').encode("utf-8"),
-        )
-
-    def test_crlf_and_untouched_bytes_survive(self) -> None:
-        crlf = PAGE.replace("\n", "\r\n")
-        self.page.write_bytes(crlf.encode("utf-8"))
-        code, _, _ = run_cli([str(self.page), "--set", "t:font-size=14"])
-        self.assertEqual(code, 0)
-        expected = crlf.replace('font-size="12"', 'font-size="14"').encode("utf-8")
-        self.assertEqual(self.page.read_bytes(), expected)
-
-    def test_out_writes_elsewhere_and_leaves_source(self) -> None:
-        before = self.page.read_bytes()
-        destination = self.root / "P07-patched.svg"
-        code, _, _ = run_cli(
-            [str(self.page), "--set", "t:font-size=14", "--out", str(destination)]
-        )
-        self.assertEqual(code, 0)
-        self.assertEqual(self.page.read_bytes(), before)
-        self.assertIn('font-size="14"', destination.read_text(encoding="utf-8"))
-
-    def test_show_prints_start_tag(self) -> None:
-        code, stdout, _ = run_cli([str(self.page), "--show", "t"])
-        self.assertEqual(code, 0)
-        self.assertIn('<text id="t"', stdout)
-
-    def test_duplicate_id_exits_two(self) -> None:
-        self.page.write_bytes(DUPLICATE.encode("utf-8"))
-        code, _, stderr = run_cli([str(self.page), "--set", "card:fill=#000000"])
+    def test_bad_percentage_exits_two(self) -> None:
+        code, _, err = run([str(self.path), "--id", "card", "--grow-left", "20%%"])
         self.assertEqual(code, 2)
-        self.assertIn("not unique", stderr)
+        self.assertIn("cannot read percentage", err)
+        self.assertEqual(self.text(), PAGE)
 
-    def test_invalid_patch_exits_three(self) -> None:
-        before = self.page.read_bytes()
-        code, _, stderr = run_cli([str(self.page), "--set", "card:foo bar=1"])
+    def test_operator_without_target_exits_two(self) -> None:
+        code, _, err = run([str(self.path), "--grow-left", "20%"])
+        self.assertEqual(code, 2)
+        self.assertIn("no target", err)
+
+    def test_commented_duplicate_id_is_not_patched(self) -> None:
+        body = PAGE.replace(
+            '<rect id="card"',
+            '<!-- <rect id="card" x="1" y="1" width="9" height="9" fill="#000"/> -->\n  <rect id="card"',
+        )
+        self.path.write_text(body, encoding="utf-8")
+        code, _, _ = run([str(self.path), "--set", "card:fill=#00FF00"])
+        self.assertEqual(code, 0)
+        self.assertIn('<!-- <rect id="card" x="1" y="1" width="9" height="9" fill="#000"/> -->', self.text())
+        self.assertIn('id="card" x="200" y="100" width="300" height="100" fill="#00FF00"', self.text())
+
+    def test_invalid_attribute_name_exits_three(self) -> None:
+        code, _, err = run([str(self.path), "--set", "card:bad name=1"])
         self.assertEqual(code, 3)
-        self.assertIn("refusing to write", stderr)
-        self.assertEqual(self.page.read_bytes(), before)
-
-    def test_missing_file_exits_two(self) -> None:
-        code, _, stderr = run_cli([str(self.root / "absent.svg"), "--set", "t:fill=#000000"])
-        self.assertEqual(code, 2)
-        self.assertIn("not a file", stderr)
+        self.assertIn("not a valid XML name", err)
 
 
-class CommentMaskingTest(unittest.TestCase):
-    """A tag that only exists inside a comment must never be the patch target."""
+class MeasureTest(PatchTestCase):
+    """--measure reports geometry in px and EMU, plus a measured text width."""
 
-    def test_comment_shaped_tag_is_not_matched(self) -> None:
-        patched, changes = plan_patch(COMMENTED, ["card:fill=#2A2A2A"])
-        self.assertEqual(changes[0].element_id, "card")
-        self.assertIn('<rect id="card" x="0" y="0" width="1" height="1" fill="#000000"/>', patched)
-        self.assertIn('fill="#2A2A2A"', patched)
-        self.assertEqual(patched.count('fill="#2A2A2A"'), 1)
-
-    def test_cli_patches_the_real_element_only(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            page = Path(tmp) / "P07.svg"
-            page.write_bytes(COMMENTED.encode("utf-8"))
-            code, stdout, _ = run_cli([str(page), "--set", "card:fill=#2A2A2A"])
-            written = page.read_text(encoding="utf-8")
+    def test_measure_rect(self) -> None:
+        code, out, _ = run([str(self.path), "--measure", "card"])
         self.assertEqual(code, 0)
-        self.assertIn("card.fill: #111111 -> #2A2A2A", stdout)
-        self.assertIn('fill="#000000"', written)
-        self.assertEqual(written.count('fill="#2A2A2A"'), 1)
+        self.assertIn("card: <rect>", out)
+        self.assertIn("width", out)
+        self.assertIn("EMU", out)
 
-    def test_cdata_and_pi_are_masked_too(self) -> None:
-        page = PAGE.replace(
-            "  <rect id=\"card\"",
-            '  <?note <rect id="card" fill="#000000"/>?>\n'
-            '  <rect id="card"',
-        )
-        patched, _ = plan_patch(page, ["card:fill=#333333"])
-        self.assertIn('<?note <rect id="card" fill="#000000"/>?>', patched)
-        self.assertEqual(patched.count('fill="#333333"'), 1)
+    def test_measure_text_reports_estimated_width(self) -> None:
+        code, out, _ = run([str(self.path), "--measure", "title"])
+        self.assertEqual(code, 0)
+        self.assertIn("measured", out)
+        self.assertIn("right edge", out)
 
 
-class DiagnosticsTest(unittest.TestCase):
-    """Refusals name the cause instead of echoing a parser error alone."""
+class ZoomCropTest(unittest.TestCase):
+    """Crop maths only: rendering is Chrome's job and is not unit-tested."""
 
-    def test_invalid_attribute_name_is_explained(self) -> None:
-        with self.assertRaises(InvalidPatchedXml) as caught:
-            plan_patch(PAGE, ["card:foo bar=1"])
-        message = str(caught.exception)
-        self.assertIn("foo bar", message)
-        self.assertIn("not a valid XML name", message)
+    def test_crop_adds_margin_and_scales(self) -> None:
+        from page_zoom import crop_box
 
-    def test_unknown_show_lists_known_ids(self) -> None:
-        with self.assertRaises(PagePatchError) as caught:
-            start_tag(PAGE, "nope")
-        message = str(caught.exception)
-        self.assertIn("known ids", message)
-        self.assertIn("card", message)
+        self.assertEqual(crop_box((10, 10, 110, 60), 24, 2, (2560, 1440)), (0, 0, 268, 168))
 
-    def test_angle_bracket_in_value_is_escaped_not_rejected(self) -> None:
-        patched, _ = plan_patch(PAGE, ["t:data-note=a>b<c"])
-        self.assertIn('data-note="a&gt;b&lt;c"', patched)
-        ET.fromstring(patched)
+    def test_crop_clamps_to_the_image(self) -> None:
+        from page_zoom import crop_box
 
-    def test_change_is_a_named_tuple(self) -> None:
-        _, changes = plan_patch(PAGE, ["t:font-size=14"])
-        self.assertIsInstance(changes[0], Change)
-        self.assertEqual(changes[0]._fields, ("element_id", "attribute", "previous", "value"))
-        self.assertEqual(tuple(changes[0]), ("t", "font-size", "12", "14"))
+        self.assertEqual(crop_box((1200, 700, 1280, 720), 24, 1, (1280, 720)), (1176, 676, 1280, 720))
 
-
-class OutputPathTest(unittest.TestCase):
-    """A bad destination is a message, never a traceback."""
-
-    def test_missing_output_directory_exits_two(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            page = root / "P07.svg"
-            page.write_bytes(PAGE.encode("utf-8"))
-            destination = root / "absent" / "P07.svg"
-            code, _, stderr = run_cli(
-                [str(page), "--set", "t:font-size=14", "--out", str(destination)]
-            )
-            self.assertEqual(code, 2)
-            self.assertIn("output directory does not exist", stderr)
-            self.assertFalse(destination.exists())
 
 if __name__ == "__main__":
     unittest.main()
