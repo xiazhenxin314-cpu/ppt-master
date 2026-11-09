@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Command line for the aesthetic audit.
+"""Command line for page checks.
 
 Owns argument parsing, page discovery, terminal rendering, and the optional JSON
-report. Parsed-page failures are wrapped into a Page with `error` set so the
-report keeps one row per discovered page.
+report. A page that cannot be parsed keeps one row in the report so nothing is
+silently dropped.
 
 Usage:
-    python3 scripts/aesthetic_audit.py <project_path> [options]
+    python3 scripts/page_check.py <project_path> [options]
 
 Examples:
-    python3 scripts/aesthetic_audit.py projects/demo --json validation/aesthetic_audit.json
-    python3 scripts/aesthetic_audit.py projects/demo --only contrast --top 5
+    python3 scripts/page_check.py projects/demo
+    python3 scripts/page_check.py projects/demo --json validation/page_check.json
+    python3 scripts/page_check.py projects/demo --only off_canvas --top 5
 
 Dependencies:
     Standard library plus local PPT Master sibling modules.
@@ -26,9 +27,9 @@ from xml.etree import ElementTree as ET
 
 from slide_roster import discover_slide_svgs
 
-from .audit import audit_pages
-from .metrics import METRICS, select_metrics
+from .checks import CHECKS, select_checks
 from .page import Page, parse_page
+from .report import check_pages
 
 
 def collect_pages(target: Path) -> list[Path]:
@@ -52,56 +53,50 @@ def parse_pages(paths: list[Path]) -> list[Page]:
 
 
 def render_table(report: dict, top: int = 10) -> str:
-    """Render the human-readable ranking table."""
-    lines = [f'{"page":<28}{"score":>7}  worst metric']
+    """Render the human-readable findings table."""
+    lines = [f'{"page":<28}{"findings":>9}  first finding']
     for row in report["pages"][:top]:
-        if row.get("status") == "error":
-            reason = row.get("error") or "; ".join(
-                entry.get("error", "") for entry in row.get("errors", [])
-            ) or "metric failed"
-            lines.append(f'{row["page"]:<28}{"ERR":>7}  {reason}')
+        if "error" in row:
+            lines.append(f'{row["page"]:<28}{"ERR":>9}  {row["error"]}')
             continue
-        scores = row.get("scores") or {}
-        worst = max(scores, key=scores.get) if scores else "-"
-        lines.append(f'{row["page"]:<28}{row["score"]:>7.3f}  {worst}={scores.get(worst, 0):.3f}')
-    lines.append(f'pages={len(report["pages"])}  metrics={",".join(report["metrics"])}')
+        findings = row.get("findings", [])
+        if not findings:
+            lines.append(f'{row["page"]:<28}{0:>9}  -')
+            continue
+        first = findings[0]
+        lines.append(f'{row["page"]:<28}{len(findings):>9}  {first.get("check")}: {first.get("message", "")}')
+    lines.append(f'pages={len(report["pages"])}  checks={",".join(report["checks"])}')
     return "\n".join(lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser."""
     parser = argparse.ArgumentParser(
-        description="Per-page proxy metrics for aesthetic repair.",
+        description="Report factual page problems: no scores, only findings.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("target", nargs="?", help="project path, svg directory, or one svg file")
     parser.add_argument("--json", metavar="PATH", help="write the full report here")
-    parser.add_argument("--only", metavar="IDS", help="comma separated metric ids")
-    parser.add_argument(
-        "--grid",
-        type=float,
-        default=None,
-        help="layout grid step in px; omit to skip the grid metric",
-    )
+    parser.add_argument("--only", metavar="IDS", help="comma separated check ids")
     parser.add_argument(
         "--min-contrast",
         type=float,
         default=4.5,
-        help="WCAG threshold (default 4.5)",
+        help="WCAG floor for body text (default 4.5)",
     )
-    parser.add_argument("--list", action="store_true", help="list registered metrics and exit")
+    parser.add_argument("--list", action="store_true", help="list registered checks and exit")
     parser.add_argument("--top", type=int, default=10, help="rows printed to stdout (default 10)")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the audit and return an exit code."""
+    """Run the checks and return an exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.list:
-        for key, spec in METRICS.items():
-            print(f"{key:<18} {spec.summary}")
+        for key, spec in CHECKS.items():
+            print(f"{key:<14} {spec.summary}")
         return 0
     if not args.target:
         parser.print_help()
@@ -112,12 +107,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No SVG pages found under {target}", file=sys.stderr)
         return 2
     only = {part.strip() for part in args.only.split(",")} if args.only else None
-    selected = select_metrics(only)
+    selected = select_checks(only)
     if not selected:
-        print("No registered metric matches --only", file=sys.stderr)
+        print("No registered check matches --only", file=sys.stderr)
         return 2
-    config = {"grid": args.grid, "min_contrast": args.min_contrast}
-    report = audit_pages(parse_pages(paths), selected, config)
+    report = check_pages(parse_pages(paths), selected, {"min_contrast": args.min_contrast})
     if args.json:
         destination = Path(args.json)
         try:

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Page model for the aesthetic audit.
+"""Page model for page checks.
 
 Parses one page SVG into positioned primitives with composed transforms, and
-owns the small amount of colour arithmetic the metrics share.
+owns the small amount of colour arithmetic the checks share.
 
 Usage:
-    Imported by aesthetic_quality.metrics and aesthetic_quality.cli.
+    Imported by page_checks.checks, page_checks.report, and page_checks.cli.
 
 Examples:
     page = parse_page(Path("projects/demo/svg_output/P01.svg"))
@@ -113,19 +113,7 @@ def _walk(elem, matrix, inherited_fill, inherited_size, out: list[Node], depth: 
     text = "".join(elem.itertext()).strip() if tag == "text" else ""
     bbox = _text_bbox(attrs, text) if tag == "text" else _raw_bbox(tag, attrs)
     if bbox is not None and matrix != ID_MATRIX:
-        # A rotated box has no axis-aligned diagonal: map all four corners and
-        # take the extremes, otherwise an arbitrary rotation reports a box that
-        # is smaller than the shape it contains.
-        x1, y1, x2, y2 = bbox
-        corners = (
-            _apply(matrix, x1, y1),
-            _apply(matrix, x2, y1),
-            _apply(matrix, x1, y2),
-            _apply(matrix, x2, y2),
-        )
-        xs = [point[0] for point in corners]
-        ys = [point[1] for point in corners]
-        bbox = (min(xs), min(ys), max(xs), max(ys))
+        bbox = transform_bbox(bbox, matrix)
     if bbox is not None and tag in SHAPE_TAGS:
         out.append(
             Node(
@@ -142,6 +130,63 @@ def _walk(elem, matrix, inherited_fill, inherited_size, out: list[Node], depth: 
     for child in elem:
         if isinstance(child.tag, str):
             _walk(child, matrix, fill, size, out, depth + 1)
+
+
+def transform_bbox(bbox, matrix):
+    """Map a box through an affine matrix and return its upright bounding box.
+
+    A rotated box has no axis-aligned diagonal, so all four corners are mapped
+    and the extremes taken; the diagonal pair alone reports a box that is
+    smaller than the shape it contains.
+    """
+    x1, y1, x2, y2 = bbox
+    corners = (
+        _apply(matrix, x1, y1),
+        _apply(matrix, x2, y1),
+        _apply(matrix, x1, y2),
+        _apply(matrix, x2, y2),
+    )
+    xs = [point[0] for point in corners]
+    ys = [point[1] for point in corners]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def element_boxes(path: Path) -> dict[str, tuple[float, float, float, float]]:
+    """Return the upright bounding box of every element that carries an id.
+
+    A group's box is the union of its descendants, so a page tool can point at
+    <g id="title-block"> without knowing which child holds the ink.
+    """
+    root = ET.parse(str(path)).getroot()
+    boxes: dict[str, tuple[float, float, float, float]] = {}
+    _walk_boxes(root, ID_MATRIX, boxes)
+    return boxes
+
+
+def _walk_boxes(elem, matrix, out: dict) -> tuple[float, float, float, float] | None:
+    """Collect per-id boxes depth-first, unions propagating to ancestors."""
+    tag = elem.tag.split("}")[-1] if isinstance(elem.tag, str) else ""
+    attrs = dict(elem.attrib)
+    matrix = _matrix_multiply(matrix, _parse_transform(attrs.get("transform")))
+    text = "".join(elem.itertext()).strip() if tag == "text" else ""
+    own = _text_bbox(attrs, text) if tag == "text" else _raw_bbox(tag, attrs)
+    union = transform_bbox(own, matrix) if own is not None else None
+    for child in elem:
+        if not isinstance(child.tag, str):
+            continue
+        child_box = _walk_boxes(child, matrix, out)
+        if child_box is None:
+            continue
+        union = child_box if union is None else (
+            min(union[0], child_box[0]),
+            min(union[1], child_box[1]),
+            max(union[2], child_box[2]),
+            max(union[3], child_box[3]),
+        )
+    element_id = attrs.get("id")
+    if element_id and union is not None and element_id not in out:
+        out[element_id] = union
+    return union
 
 
 def _matrix_multiply(left, right):
@@ -215,7 +260,7 @@ def _num(attrs: dict, key: str, default: float = 0.0) -> float:
 
 def _raw_bbox(tag: str, attrs: dict):
     """Return the untransformed bounding box of one primitive, or None."""
-    if tag == "rect":
+    if tag in {"rect", "image"}:
         x, y = _num(attrs, "x"), _num(attrs, "y")
         return (x, y, x + _num(attrs, "width"), y + _num(attrs, "height"))
     if tag in {"circle", "ellipse"}:
