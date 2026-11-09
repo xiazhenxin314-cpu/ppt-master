@@ -2444,6 +2444,10 @@
       {
         "glob": "skills/ppt-master/scripts/docs/native-data.md",
         "reason": "Closed Chart/Table payload grammar for checker/exporter behavior; native-data-interface.md carries the canonical forms, and generation roles open this file only when a payload check fails."
+      },
+      {
+        "glob": "skills/ppt-master/scripts/docs/aesthetic-audit.md",
+        "reason": "Tool documentation for the opt-in aesthetic repair loop; no generation route loads it, and both commands run only when a repair pass is invoked."
       }
     ]
   }
